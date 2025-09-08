@@ -80,7 +80,11 @@
 #define IDS_WARNING                     1001
 #define IDS_ERROR                       1002
 #define IDS_FATAL                       1003
+
 #define IDS_SHORTCUT                    1004
+#define IDC_ICON_SIZE_COMBO             512
+#define IDC_MONITOR_COMBO                513
+#define IDC_POSITION_COMBO               514
 
 // Next default values for new objects
 // 

@@ -29,8 +29,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>
 #include <stdio.h>
 #include <time.h>
 
+
 #include "resource.h"
 #include "utils.h"
+#include "icon_sizes.h"
+#include "MonitorManager.h"
+
+// Icon size global
+int gIconSize = ICON_SIZE_32;
+int gCurrentIconSize = ICON_SIZE_32; // Animasyonlu geçici boyut
+bool gIsShrunk = false;
 
 #define PROG_NAME _T("LaunchBar")
 #define VERSION_STR _T("3.1.1")
@@ -41,8 +49,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>
 #define WIND_CLASS_NAME PROG_NAME
 
 // Global variables
+int gMonitorIndex = 0;
+int gBarPositionType = 0;
 HWND      gMainWindow;              // The main toolbar window
 RECT      gWindowRect;              // Main window rectangle in screen coordinates
+int       gBarPosX = 0;             // Bar X pozisyonu (px)
+int       gBarPosY = 0;             // Bar Y pozisyonu (px)
 POINT     gWindowSize;              // Window size for convenience
 CString   gMainDir(EMPTY_STR);      // Directory to watch and mirror
 CString   gAppPath;                 // The path to the executable
@@ -85,7 +97,6 @@ struct {
 } gButtons = {0};
 
 // Layout data
-BOOL gLargeIcons = FALSE; // Use large buttons
 BOOL gLargeMenus = FALSE; // Use large folder menu entries
 BOOL gOnTop = FALSE;      // Toolbar always on top
 DWORD gAutoHide = 0;      // Hide toolbar when loosing focus
@@ -96,7 +107,7 @@ BOOL gCenter = FALSE;     // Center the toolbar
 DWORD xOffset, yOffset;  // Offset from window border to button
 DWORD xInc, yInc;        // Increment between buttons
 
-#define ICON_SIZE (gLargeIcons ? 32 : 16) // Standard icon sizes
+#define ICON_SIZE (gCurrentIconSize) // Standard icon sizes
 #define ICON_OFF (gLargeIcons ? 5 : 3)    // Offset between the icon frame and the toolbar window frame
 #define WIND_OFF 12                       // Offset between toolbar window edge and first/last button
 #define MARK_RADIUS 3                     // Radius of a circle used to mark the toolbar window own space used for the popup menu
@@ -254,13 +265,45 @@ BOOL AutoHide(BOOL hide)
 //--------------------------------------------------------------------------
 
 BOOL SetupLayout()
+   // Monitör sayısı değişirse veya tek monitör varsa index'i sıfırla
+   static int prevMonitorCount = -1;
+   if ((int)monitors.size() != prevMonitorCount) {
+      if (gMonitorIndex >= (int)monitors.size()) gMonitorIndex = 0;
+      prevMonitorCount = (int)monitors.size();
+   }
+   if (monitors.size() == 1 && gMonitorIndex != 0) {
+      gMonitorIndex = 0;
+   }
+   // Bar başka monitöre/pozisyona taşındığında animasyon state'i sıfırla
+   static int prevMonitor = -1, prevPosType = -1;
+   if (prevMonitor != gMonitorIndex || prevPosType != gBarPositionType) {
+      gCurrentIconSize = gIconSize;
+      gIsShrunk = false;
+      KillTimer(gMainWindow, 2000);
+      KillTimer(gMainWindow, 2001);
+      prevMonitor = gMonitorIndex;
+      prevPosType = gBarPositionType;
+   }
 {
    // Position the buttons according to their placement in the list
    DWORD xButtonPos, yButtonPos;
    DWORD xButtonSize, yButtonSize;
    DWORD inc;
-   RECT screenRect;
-   SystemParametersInfo(SPI_GETWORKAREA, 0, &screenRect, 0);
+
+   // Seçili monitörün koordinatlarını al
+   RECT screenRect = {0,0,0,0};
+   auto monitors = MonitorManager::GetAllMonitors();
+   if (gMonitorIndex >= 0 && gMonitorIndex < (int)monitors.size()) {
+      screenRect = monitors[gMonitorIndex].rect;
+   } else if (!monitors.empty()) {
+      screenRect = monitors[0].rect;
+   } else {
+      SystemParametersInfo(SPI_GETWORKAREA, 0, &screenRect, 0);
+   }
+
+   // Pozisyonu ayarla (0:Left, 1:Top, 2:Right, 3:Bottom)
+   int posType = gBarPositionType;
+   if (posType < 0 || posType > 3) posType = 0;
 
    xButtonSize = ICON_SIZE + ICON_OFF*2;
    yButtonSize = xButtonSize;
@@ -268,10 +311,7 @@ BOOL SetupLayout()
    yOffset = xOffset;
    inc = (gLargeIcons ? 2 : 0);
 
-   IN_RANGE(gLocation, 1, 4);
-
-   if (gLocation == 1)
-   {
+   if (posType == 0) {
       // Left
       xInc = 0;
       yInc = yButtonSize + inc;
@@ -281,9 +321,7 @@ BOOL SetupLayout()
       gWindowRect.right = gWindowRect.left + xOffset*2 + xButtonSize + 2;
       gWindowRect.top = screenRect.top;
       gWindowRect.bottom = gWindowRect.top + yButtonPos*2 + gButtons.cnt*yInc;
-   }
-   else if (gLocation == 2)
-   {
+   } else if (posType == 1) {
       // Top
       xInc = xButtonSize + inc;
       yInc = 0;
@@ -293,9 +331,7 @@ BOOL SetupLayout()
       gWindowRect.right = gWindowRect.left + xButtonPos*2 + gButtons.cnt*xInc;
       gWindowRect.top = screenRect.top;
       gWindowRect.bottom = gWindowRect.top + yOffset*2 + yButtonSize + 2;
-   }
-   else if (gLocation == 3)
-   {
+   } else if (posType == 2) {
       // Right
       xInc = 0;
       yInc = yButtonSize + inc;
@@ -305,9 +341,7 @@ BOOL SetupLayout()
       gWindowRect.left = gWindowRect.right - xOffset*2 - xButtonSize - 2;
       gWindowRect.top = screenRect.top;
       gWindowRect.bottom = gWindowRect.top + yButtonPos*2 + gButtons.cnt*yInc;
-   }
-   else
-   {
+   } else {
       // Bottom
       xInc = xButtonSize + inc;
       yInc = 0;
@@ -716,6 +750,11 @@ LRESULT APIENTRY ButtonWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
          break;
 
       case WM_MOUSEMOVE:
+         // Mouse bar'a yaklaştıysa büyütme animasyonu başlat
+         if (gIsShrunk) {
+            SetTimer(gMainWindow, 2001, 25, NULL); // 0.5s / 20 adım
+            gIsShrunk = false;
+         }
          // Cursor has entered this button
          if (!tracker)
          {
@@ -734,6 +773,11 @@ LRESULT APIENTRY ButtonWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
          break;
 
       case WM_MOUSELEAVE:
+         // Mouse bar'dan uzaklaştıysa küçültme animasyonu başlat
+         if (!gIsShrunk) {
+            SetTimer(gMainWindow, 2000, 15, NULL); // 0.3s / 20 adım
+            gIsShrunk = true;
+         }
          // Cursor is leaving this button
          InvalidateRect(hWnd, NULL, TRUE); // Back to normal
          tracker = NULL;
@@ -1135,6 +1179,10 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 //--------------------------------------------------------------------------
 
 #define AUTOSTART_SHORTCUT GetAutoStartDir() + PROG_NAME + SHORTCUT_EXT
+// Çoklu monitör ve pozisyon için global değişkenler
+int gMonitorIndex = 0;
+int gBarPositionType = 0; // 0:LEFT, 1:TOP, 2:RIGHT, 3:BOTTOM
+
 INT_PTR CALLBACK Settings(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
 #define UPDATE_CLICK_OP \
@@ -1146,62 +1194,115 @@ INT_PTR CALLBACK Settings(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	   case WM_INITDIALOG:
-         CheckRadioButton(hDlg, IDC_RADIO1, IDC_RADIO4, IDC_RADIO1 + gLocation-1);
-         CheckDlgButton(hDlg, IDC_CHECK7, gCenter);
-         CheckDlgButton(hDlg, IDC_CHECK1, gLargeIcons);
-         CheckDlgButton(hDlg, IDC_CHECK2, gOnTop);
-         CheckDlgButton(hDlg, IDC_CHECK3, gAutoHide > 0);
-         CheckDlgButton(hDlg, IDC_CHECK4, gAutoHide > 1);
-         CheckDlgButton(hDlg, IDC_CHECK6, gLargeMenus);
-         UPDATE_CLICK_OP
-         CheckDlgButton(hDlg, IDC_CHECK5, FileExists(AUTOSTART_SHORTCUT));
+      CheckRadioButton(hDlg, IDC_RADIO1, IDC_RADIO4, IDC_RADIO1 + gLocation-1);
+      CheckDlgButton(hDlg, IDC_CHECK7, gCenter);
+      CheckDlgButton(hDlg, IDC_CHECK2, gOnTop);
+      CheckDlgButton(hDlg, IDC_CHECK3, gAutoHide > 0);
+      CheckDlgButton(hDlg, IDC_CHECK4, gAutoHide > 1);
+      CheckDlgButton(hDlg, IDC_CHECK6, gLargeMenus);
+      UPDATE_CLICK_OP
+      CheckDlgButton(hDlg, IDC_CHECK5, FileExists(AUTOSTART_SHORTCUT));
 
-         PositionDialog(hDlg);
-		   return (INT_PTR)TRUE;
+
+      // Fill icon size combo box
+      HWND hCombo = GetDlgItem(hDlg, IDC_ICON_SIZE_COMBO);
+      SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)_T("32 px"));
+      SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)_T("64 px"));
+      SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)_T("96 px"));
+      SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)_T("128 px"));
+      SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)_T("256 px"));
+      int sel = 0;
+      switch (gIconSize) {
+         case ICON_SIZE_32: sel = 0; break;
+         case ICON_SIZE_64: sel = 1; break;
+         case ICON_SIZE_96: sel = 2; break;
+         case ICON_SIZE_128: sel = 3; break;
+         case ICON_SIZE_256: sel = 4; break;
+         default: sel = 0; break;
+      }
+      SendMessage(hCombo, CB_SETCURSEL, sel, 0);
+
+      // Fill monitor combo box (örnek: 1, 2, 3...)
+      HWND hMonCombo = GetDlgItem(hDlg, IDC_MONITOR_COMBO);
+      for (int i = 0; i < 8; ++i) { // max 8 monitor
+         TCHAR buf[16];
+         wsprintf(buf, _T("Monitor %d"), i+1);
+         SendMessage(hMonCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+      }
+      SendMessage(hMonCombo, CB_SETCURSEL, gMonitorIndex, 0);
+
+      // Fill position combo box
+      HWND hPosCombo = GetDlgItem(hDlg, IDC_POSITION_COMBO);
+      SendMessage(hPosCombo, CB_ADDSTRING, 0, (LPARAM)_T("Left"));
+      SendMessage(hPosCombo, CB_ADDSTRING, 0, (LPARAM)_T("Top"));
+      SendMessage(hPosCombo, CB_ADDSTRING, 0, (LPARAM)_T("Right"));
+      SendMessage(hPosCombo, CB_ADDSTRING, 0, (LPARAM)_T("Bottom"));
+      SendMessage(hPosCombo, CB_SETCURSEL, gBarPositionType, 0);
+
+      PositionDialog(hDlg);
+      return (INT_PTR)TRUE;
 
 	   case WM_COMMAND:
 		   if (LOWORD(wParam) == IDC_CHECK3)
          {
             UPDATE_CLICK_OP
          }
-		   else if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
-		   {
-            if (LOWORD(wParam) == IDOK)
-            {
-               if (IsDlgButtonChecked(hDlg, IDC_RADIO1))
-                  gLocation = 1;
-               else if (IsDlgButtonChecked(hDlg, IDC_RADIO2))
-                  gLocation = 2;
-               else if (IsDlgButtonChecked(hDlg, IDC_RADIO3))
-                  gLocation = 3;
-               else if (IsDlgButtonChecked(hDlg, IDC_RADIO4))
-                  gLocation = 4;
-               gCenter = IsDlgButtonChecked(hDlg, IDC_CHECK7);
-               gLargeIcons = IsDlgButtonChecked(hDlg, IDC_CHECK1);
-               gOnTop = IsDlgButtonChecked(hDlg, IDC_CHECK2);
-               gAutoHide = 0;
-               if (IsDlgButtonChecked(hDlg, IDC_CHECK3))
-                  gAutoHide = 1;
-               if (IsDlgButtonChecked(hDlg, IDC_CHECK4))
-                  gAutoHide = 2;
-               BOOL doRefresh = IsDlgButtonChecked(hDlg, IDC_CHECK6) != gLargeMenus;
-               gLargeMenus = IsDlgButtonChecked(hDlg, IDC_CHECK6);
-               if (gUseReg)
+               else if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
                {
-                  // Create or delete autostart shortcut
-                  if (IsDlgButtonChecked(hDlg, IDC_CHECK5))
-                     CreateShortcut(AUTOSTART_SHORTCUT, gAppPath, LoadFormatResString(IDS_APPDESCR));
-                  else
-                     DeleteFile(AUTOSTART_SHORTCUT);
+                  if (LOWORD(wParam) == IDOK)
+                  {
+                     if (IsDlgButtonChecked(hDlg, IDC_RADIO1))
+                        gLocation = 1;
+                     else if (IsDlgButtonChecked(hDlg, IDC_RADIO2))
+                        gLocation = 2;
+                     else if (IsDlgButtonChecked(hDlg, IDC_RADIO3))
+                        gLocation = 3;
+                     else if (IsDlgButtonChecked(hDlg, IDC_RADIO4))
+                        gLocation = 4;
+                     gCenter = IsDlgButtonChecked(hDlg, IDC_CHECK7);
+                     gOnTop = IsDlgButtonChecked(hDlg, IDC_CHECK2);
+                     gAutoHide = 0;
+                     if (IsDlgButtonChecked(hDlg, IDC_CHECK3))
+                        gAutoHide = 1;
+                     if (IsDlgButtonChecked(hDlg, IDC_CHECK4))
+                        gAutoHide = 2;
+                     BOOL doRefresh = IsDlgButtonChecked(hDlg, IDC_CHECK6) != gLargeMenus;
+                     gLargeMenus = IsDlgButtonChecked(hDlg, IDC_CHECK6);
+
+                     // Get icon size selection
+                     HWND hCombo = GetDlgItem(hDlg, IDC_ICON_SIZE_COMBO);
+                     int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                     switch (sel) {
+                        case 0: gIconSize = ICON_SIZE_32; break;
+                        case 1: gIconSize = ICON_SIZE_64; break;
+                        case 2: gIconSize = ICON_SIZE_96; break;
+                        case 3: gIconSize = ICON_SIZE_128; break;
+                        case 4: gIconSize = ICON_SIZE_256; break;
+                        default: gIconSize = ICON_SIZE_32; break;
+                     }
+
+                     // Monitor ve pozisyon seçimlerini al
+                     HWND hMonCombo = GetDlgItem(hDlg, IDC_MONITOR_COMBO);
+                     HWND hPosCombo = GetDlgItem(hDlg, IDC_POSITION_COMBO);
+                     gMonitorIndex = (int)SendMessage(hMonCombo, CB_GETCURSEL, 0, 0);
+                     gBarPositionType = (int)SendMessage(hPosCombo, CB_GETCURSEL, 0, 0);
+
+                     if (gUseReg)
+                     {
+                        // Create or delete autostart shortcut
+                        if (IsDlgButtonChecked(hDlg, IDC_CHECK5))
+                           CreateShortcut(AUTOSTART_SHORTCUT, gAppPath, LoadFormatResString(IDS_APPDESCR));
+                        else
+                           DeleteFile(AUTOSTART_SHORTCUT);
+                     }
+                     // Update current state accordingly
+                     if (doRefresh) Refresh(); else SetupLayout();
+                     SavePrefs();
+                     AutoHide(gAutoHide);
+                  }
+                  EndDialog(hDlg, LOWORD(wParam));
+                  return (INT_PTR)TRUE;
                }
-               // Update current state accordingly
-               if (doRefresh) Refresh(); else SetupLayout();
-               SavePrefs();
-               AutoHide(gAutoHide);
-            }
-			   EndDialog(hDlg, LOWORD(wParam));
-			   return (INT_PTR)TRUE;
-		   }
 		   break;
 	}
 	return (INT_PTR)FALSE;
@@ -1364,6 +1465,33 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
          break;
 
       case WM_TIMER:
+         // Animasyon: Küçültme
+         if (wParam == 2000) {
+            int target = (int)(gIconSize * 0.7);
+            if (gCurrentIconSize > target) {
+               gCurrentIconSize -= (gIconSize - target) / 10;
+               if (gCurrentIconSize < target) gCurrentIconSize = target;
+               SetupLayout();
+            } else {
+               gCurrentIconSize = target;
+               SetupLayout();
+               KillTimer(gMainWindow, 2000);
+            }
+            return 0;
+         }
+         // Animasyon: Büyütme
+         if (wParam == 2001) {
+            if (gCurrentIconSize < gIconSize) {
+               gCurrentIconSize += (gIconSize - gCurrentIconSize) / 10 + 1;
+               if (gCurrentIconSize > gIconSize) gCurrentIconSize = gIconSize;
+               SetupLayout();
+            } else {
+               gCurrentIconSize = gIconSize;
+               SetupLayout();
+               KillTimer(gMainWindow, 2001);
+            }
+            return 0;
+         }
          if (gAutoHide && GetForegroundWindow() != gMainWindow)
          {
             // Not in foreground
@@ -1427,21 +1555,27 @@ ATOM RegMainWindClass()
 //--------------------------------------------------------------------------
 
 // Settings registry key names
-#define LARGE_ICONS_KEY _T("UseLargeIcons")
+#define ICON_SIZE_KEY _T("IconSize")
 #define LARGE_MENUS_KEY _T("UseLargeMenus")
 #define ALWAYS_ON_TOP_KEY _T("AlwaysOnTop")
 #define AUTOHIDE_KEY _T("AutoHide")
 #define LOCATION_KEY _T("Location")
 #define CENTER_KEY _T("Center")
 #define BUTTONS_KEY _T("Buttons")
+#define BARPOSX_KEY _T("BarPosX")
+#define BARPOSY_KEY _T("BarPosY")
 
 BOOL ReadPrefs()
+   GET_REG_INT(_T("MonitorIndex"), gMonitorIndex);
+   GET_REG_INT(_T("BarPositionType"), gBarPositionType);
 {
    if (!gUseReg)
       return FALSE;
 
    // Read preferences from the registry
-   GET_REG_INT(LARGE_ICONS_KEY, gLargeIcons);
+   GET_REG_INT(ICON_SIZE_KEY, gIconSize);
+   GET_REG_INT(BARPOSX_KEY, gBarPosX);
+   GET_REG_INT(BARPOSY_KEY, gBarPosY);
    GET_REG_INT(LARGE_MENUS_KEY, gLargeMenus);
    GET_REG_INT(ALWAYS_ON_TOP_KEY, gOnTop);
    GET_REG_INT(AUTOHIDE_KEY, gAutoHide);
@@ -1463,12 +1597,16 @@ BOOL ReadPrefs()
 //--------------------------------------------------------------------------
 
 BOOL SavePrefs()
+   SET_REG_INT(_T("MonitorIndex"), gMonitorIndex);
+   SET_REG_INT(_T("BarPositionType"), gBarPositionType);
 {
 	if (!gUseReg)
 	  return FALSE;
 
 	// Save preferences to the registry
-   SET_REG_INT(LARGE_ICONS_KEY, gLargeIcons);
+   SET_REG_INT(ICON_SIZE_KEY, gIconSize);
+   SET_REG_INT(BARPOSX_KEY, gBarPosX);
+   SET_REG_INT(BARPOSY_KEY, gBarPosY);
    SET_REG_INT(LARGE_MENUS_KEY, gLargeMenus);
    SET_REG_INT(ALWAYS_ON_TOP_KEY, gOnTop);
    SET_REG_INT(AUTOHIDE_KEY, gAutoHide);

@@ -47,7 +47,12 @@ BEGIN
     CONTROL         "Top",IDC_RADIO2,"Button",BS_AUTORADIOBUTTON,15,30,49,12
     CONTROL         "Right",IDC_RADIO3,"Button",BS_AUTORADIOBUTTON,15,42,49,12
     CONTROL         "Bottom",IDC_RADIO4,"Button",BS_AUTORADIOBUTTON,15,54,49,12
-    CONTROL         "Use large icons",IDC_CHECK1,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,77,10,68,14
+    LTEXT           "Icon size:",IDC_STATIC,77,10,40,14
+    COMBOBOX        IDC_ICON_SIZE_COMBO,120,10,50,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Monitor:",IDC_STATIC,77,28,40,14
+    COMBOBOX        IDC_MONITOR_COMBO,120,28,50,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Position:",IDC_STATIC,77,46,40,14
+    COMBOBOX        IDC_POSITION_COMBO,120,46,50,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     CONTROL         "Always on top",IDC_CHECK2,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,77,36,68,14
     CONTROL         "Autostart",IDC_CHECK5,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,77,49,58,14
     CONTROL         "Auto-hide",IDC_CHECK3,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,77,62,68,14
@@ -215,7 +220,7 @@ BEGIN
             VALUE "FileDescription", "LaunchBar"
             VALUE "FileVersion", "3.1.1.0"
             VALUE "InternalName", "LaunchBar"
-            VALUE "LegalCopyright", "Copyright © 2009-2016 Peter Lerup"
+            VALUE "LegalCopyright", "Copyright ï¿½ 2009-2016 Peter Lerup"
             VALUE "OriginalFilename", "LaunchBar.exe"
             VALUE "ProductName", "  LaunchBar"
             VALUE "ProductVersion", "3.1.1.0"
