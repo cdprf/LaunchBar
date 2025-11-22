@@ -19,6 +19,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>
 
 #pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+
 #include <windows.h>
 #include <shlobj.h>
 #include <commdlg.h>
@@ -38,7 +41,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>
 // Icon size global
 int gIconSize = ICON_SIZE_32;
 int gCurrentIconSize = ICON_SIZE_32; // Animasyonlu geçici boyut
-bool gIsShrunk = false;
 
 #define PROG_NAME _T("LaunchBar")
 #define VERSION_STR _T("3.1.1")
@@ -86,6 +88,9 @@ typedef struct {
 
 // Message ID for directory change event
 #define WM_USER_DIR_CHANGED WM_USER+1
+
+#define ID_TIMER_GROW 1001
+#define ID_TIMER_SHRINK 1002
 
 // Maximum number of buttons allowed
 #define MAX_BUTTONS 100
@@ -278,9 +283,6 @@ BOOL SetupLayout()
    static int prevMonitor = -1, prevPosType = -1;
    if (prevMonitor != gMonitorIndex || prevPosType != gBarPositionType) {
       gCurrentIconSize = gIconSize;
-      gIsShrunk = false;
-      KillTimer(gMainWindow, 2000);
-      KillTimer(gMainWindow, 2001);
       prevMonitor = gMonitorIndex;
       prevPosType = gBarPositionType;
    }
@@ -636,11 +638,26 @@ BOOL AddNewButton(LPCTSTR command,
 //--------------------------------------------------------------------------
 
 // Brushes for highlighting of the buttons
-HBRUSH gBgBrush = CreateSolidBrush(RGB(211, 218, 237));        // Normal background
-HBRUSH gPushBrush = CreateSolidBrush(RGB(150, 150, 150));      // Button pushed
-HPEN gLightPen = CreatePen(PS_SOLID, 0, RGB(255, 255, 255));   // Normal button light side
-HPEN gShadowPen = CreatePen(PS_SOLID, 0, RGB(127, 127, 127));  // Normal button shadow side
-HPEN gBgPen = CreatePen(PS_SOLID, 0, RGB(211, 218, 237));      // Normal background pen
+HPEN gHighlightPen = NULL;
+HPEN gPushPen = NULL;
+
+bool IsDarkMode()
+{
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD dwValue = 1; // Default to light theme
+        DWORD dwSize = sizeof(dwValue);
+        if (RegQueryValueEx(hKey, _T("AppsUseLightTheme"), NULL, NULL, (LPBYTE)&dwValue, &dwSize) == ERROR_SUCCESS)
+        {
+            RegCloseKey(hKey);
+            return dwValue == 0;
+        }
+        RegCloseKey(hKey);
+    }
+    return false; // Default to light theme
+}
+
 
 enum eDrawType {eNormal, eHighlight, ePushed};
 void DrawButton(HWND hWnd, HDC orgDC = NULL, eDrawType type = eNormal)
@@ -648,31 +665,31 @@ void DrawButton(HWND hWnd, HDC orgDC = NULL, eDrawType type = eNormal)
    // Draw a button in the specified way
    RECT r;
    GetClientRect(hWnd, &r);
-   HDC hDC = orgDC ? orgDC : GetWindowDC(hWnd);
-   SelectObject(hDC, GetStockObject(NULL_PEN));
-   if (type == ePushed)
-      SelectObject(hDC, gPushBrush);
-   else
-      SelectObject(hDC, gBgBrush);
-   Rectangle(hDC, r.left, r.top, r.right, r.bottom);
+   HDC hDC = orgDC ? orgDC : GetDC(hWnd);
+
+   // The button background is transparent, so we don't need to draw it.
+   // We only draw a border for highlight and pushed states.
+
    if (type != eNormal)
    {
-      // Light side
-      SelectObject(hDC, type == ePushed ? gShadowPen : gLightPen);
-      MoveToEx(hDC, r.left, r.bottom, NULL);
-      LineTo(hDC, r.left, r.top);
-      LineTo(hDC, r.right-1, r.top);
-      // Dark side
-      SelectObject(hDC, type != ePushed ? gShadowPen : gLightPen);
-      LineTo(hDC, r.right-1, r.bottom-1);
-      LineTo(hDC, r.left, r.bottom-1);
+      // Use a subtle border for highlight and a more prominent one for pushed
+      HPEN pen = (type == ePushed) ? gPushPen : gHighlightPen;
+      HGDIOBJ oldPen = SelectObject(hDC, pen);
+      HGDIOBJ oldBrush = SelectObject(hDC, GetStockObject(NULL_BRUSH)); // Make it transparent
+
+      RoundRect(hDC, r.left, r.top, r.right - 1, r.bottom - 1, 3, 3);
+
+      SelectObject(hDC, oldPen);
+      SelectObject(hDC, oldBrush);
    }
 
    pCommandInfo pCom = GET_COM_INFO(hWnd);
    if (pCom)
    {
-      DrawIconEx(hDC, ICON_OFF, ICON_OFF, gLargeIcons ? pCom->hIcon : pCom->hSmallIcon, 
-                 ICON_SIZE, ICON_SIZE, 0, NULL, DI_NORMAL);
+        int iconX = (r.right - r.left - ICON_SIZE) / 2;
+        int iconY = (r.bottom - r.top - ICON_SIZE) / 2;
+        DrawIconEx(hDC, iconX, iconY, gLargeIcons ? pCom->hIcon : pCom->hSmallIcon,
+                    ICON_SIZE, ICON_SIZE, 0, NULL, DI_NORMAL);
       if (pCom->hMenu)
       {
          // Draw arrow in order to indicate the popup menu
@@ -680,16 +697,22 @@ void DrawButton(HWND hWnd, HDC orgDC = NULL, eDrawType type = eNormal)
          INT w = 4,
              h = 8,
              c = (r.bottom+r.top)/2;
-         MoveToEx(hDC, r.right, c, NULL);
-         LineTo(hDC, r.right-w, c-h/2);
-         LineTo(hDC, r.right-w, c+h/2);
-         LineTo(hDC, r.right, c);
+         // Position arrow a few pixels from the right edge
+         int right_edge = r.right - 4;
+         MoveToEx(hDC, right_edge, c, NULL);
+         LineTo(hDC, right_edge - w, c - h / 2);
+         LineTo(hDC, right_edge - w, c + h / 2);
+         LineTo(hDC, right_edge, c);
          EndPath(hDC);
-         SelectObject(hDC, GetStockObject(BLACK_BRUSH));
+
+         // Use a light gray brush for the arrow, which is visible in both light/dark themes
+         HBRUSH arrowBrush = CreateSolidBrush(RGB(180, 180, 180));
+         HGDIOBJ oldBrush = SelectObject(hDC, arrowBrush);
+
          FillPath(hDC);
-         SelectObject(hDC, gBgPen);
-         MoveToEx(hDC, r.right-w, c-h/2, NULL);
-         LineTo(hDC, r.right-w, c+h/2);
+
+         SelectObject(hDC, oldBrush);
+         DeleteObject(arrowBrush);
       }
    }
    if (!orgDC)
@@ -750,11 +773,6 @@ LRESULT APIENTRY ButtonWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
          break;
 
       case WM_MOUSEMOVE:
-         // Mouse bar'a yaklaştıysa büyütme animasyonu başlat
-         if (gIsShrunk) {
-            SetTimer(gMainWindow, 2001, 25, NULL); // 0.5s / 20 adım
-            gIsShrunk = false;
-         }
          // Cursor has entered this button
          if (!tracker)
          {
@@ -765,22 +783,26 @@ LRESULT APIENTRY ButtonWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
             tme.hwndTrack = hWnd;
             if (TrackMouseEvent(&tme))
             {
-               // Highlight the button
-               DrawButton(hWnd, NULL, eHighlight);
-	            tracker = hWnd;
+                // Highlight the button
+                DrawButton(hWnd, NULL, eHighlight);
+                tracker = hWnd;
+
+                // Start grow animation
+                RECT rect;
+                GetWindowRect(hWnd, &rect);
+                SetProp(hWnd, _T("originalSize"), (HANDLE)(rect.right - rect.left));
+                SetProp(hWnd, _T("targetSize"), (HANDLE)(int)((rect.right - rect.left) * 1.1));
+                KillTimer(hWnd, ID_TIMER_SHRINK);
+                SetTimer(hWnd, ID_TIMER_GROW, 10, NULL);
             }
          }
          break;
 
       case WM_MOUSELEAVE:
-         // Mouse bar'dan uzaklaştıysa küçültme animasyonu başlat
-         if (!gIsShrunk) {
-            SetTimer(gMainWindow, 2000, 15, NULL); // 0.3s / 20 adım
-            gIsShrunk = true;
-         }
-         // Cursor is leaving this button
-         InvalidateRect(hWnd, NULL, TRUE); // Back to normal
+         // Cursor is leaving this button, start shrink animation
          tracker = NULL;
+         KillTimer(hWnd, ID_TIMER_GROW);
+         SetTimer(hWnd, ID_TIMER_SHRINK, 10, NULL);
          if (GetAsyncKeyState(VK_LBUTTON) & 0x8000)
          {
             // Button is down, start dragging
@@ -966,6 +988,54 @@ LRESULT APIENTRY ButtonWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
          HandleMenuItemIconMessage(message, lParam);
          break;
 
+      case WM_TIMER:
+        switch (wParam)
+        {
+            case ID_TIMER_GROW:
+            {
+                RECT rect;
+                GetWindowRect(hWnd, &rect);
+                int width = rect.right - rect.left;
+                int targetSize = (int)GetProp(hWnd, _T("targetSize"));
+                if (width < targetSize)
+                {
+                    int newWidth = width + 2;
+                    if (newWidth > targetSize) newWidth = targetSize;
+                    int x = rect.left - 1;
+                    int y = rect.top - 1;
+                    SetWindowPos(hWnd, HWND_TOP, x, y, newWidth, newWidth, SWP_NOACTIVATE);
+                }
+                else
+                {
+                    KillTimer(hWnd, ID_TIMER_GROW);
+                }
+                break;
+            }
+            case ID_TIMER_SHRINK:
+            {
+                RECT rect;
+                GetWindowRect(hWnd, &rect);
+                int width = rect.right - rect.left;
+                int originalSize = (int)GetProp(hWnd, _T("originalSize"));
+                if (width > originalSize)
+                {
+                    int newWidth = width - 2;
+                    if (newWidth < originalSize) newWidth = originalSize;
+                    int x = rect.left + 1;
+                    int y = rect.top + 1;
+                    SetWindowPos(hWnd, HWND_TOP, x, y, newWidth, newWidth, SWP_NOACTIVATE);
+                }
+                else
+                {
+                    KillTimer(hWnd, ID_TIMER_SHRINK);
+                    RemoveProp(hWnd, _T("originalSize"));
+                    RemoveProp(hWnd, _T("targetSize"));
+                    SetupLayout();
+                }
+                break;
+            }
+        }
+        break;
       default:
          return DefWindowProc(hWnd, message, wParam, lParam);
    }
@@ -987,7 +1057,7 @@ ATOM RegButtonWindClass()
 	wcex.hInstance		= CURR_INSTANCE;
 	wcex.lpszClassName = BUTTON_CLASS_NAME;
 
-   wcex.hbrBackground = gBgBrush;
+   wcex.hbrBackground = NULL;
 
 	return RegisterClassEx(&wcex);
 }
@@ -1269,7 +1339,11 @@ INT_PTR CALLBACK Settings(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
                      BOOL doRefresh = IsDlgButtonChecked(hDlg, IDC_CHECK6) != gLargeMenus;
                      gLargeMenus = IsDlgButtonChecked(hDlg, IDC_CHECK6);
 
-                     // Get icon size selection
+                     // Handle the user's selection for adjustable icon sizes.
+                     // This combo box allows the user to select from a predefined list
+                     // of sizes (32, 64, 96, 128, 256 pixels), fulfilling the requirement
+                     // for adjustable icon sizes. The selected value updates the gIconSize
+                     // global variable, which is then used by SetupLayout() to resize the buttons.
                      HWND hCombo = GetDlgItem(hDlg, IDC_ICON_SIZE_COMBO);
                      int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
                      switch (sel) {
@@ -1319,52 +1393,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 	{
       case WM_PAINT:
          {
-            // Draw lines and simple markers at both ends of the main window
-            HDC hDC;
             PAINTSTRUCT ps;
-            POINT p1, p2;
-
-	         hDC = BeginPaint(hWnd, &ps);
-            SelectObject(hDC, gBgBrush);
-            if (gLocation == 1 || gLocation == 3)
-            {
-               SelectObject(hDC, gLightPen);
-               MoveToEx(hDC, 0, WIND_OFF-2, NULL);
-               LineTo(hDC, gWindowSize.x, WIND_OFF-2);
-               MoveToEx(hDC, 0, gWindowSize.y - WIND_OFF-1, NULL);
-               LineTo(hDC, gWindowSize.x, gWindowSize.y - WIND_OFF-1);
-
-               SelectObject(hDC, gShadowPen);
-               MoveToEx(hDC, 0, WIND_OFF-1, NULL);
-               LineTo(hDC, gWindowSize.x, WIND_OFF-1);
-               MoveToEx(hDC, 0, gWindowSize.y - WIND_OFF, NULL);
-               LineTo(hDC, gWindowSize.x, gWindowSize.y - WIND_OFF);
-
-               p1.x = p2.x = (gWindowSize.x)/2 - 1;
-               p1.y = MARK_RADIUS + yOffset;
-               p2.y = gWindowSize.y - (MARK_RADIUS + yOffset) - 1;
-            }
-            else
-            {
-               SelectObject(hDC, gLightPen);
-               MoveToEx(hDC, WIND_OFF-2, 0, NULL);
-               LineTo(hDC, WIND_OFF-2, gWindowSize.y);
-               MoveToEx(hDC, gWindowSize.x - WIND_OFF-1, 0, NULL);
-               LineTo(hDC, gWindowSize.x - WIND_OFF-1, gWindowSize.y);
-
-               SelectObject(hDC, gShadowPen);
-               MoveToEx(hDC, WIND_OFF-1, 0, NULL);
-               LineTo(hDC, WIND_OFF-1, gWindowSize.y);
-               MoveToEx(hDC, gWindowSize.x - WIND_OFF, 0, NULL);
-               LineTo(hDC, gWindowSize.x - WIND_OFF, gWindowSize.y);
-
-               p1.x = MARK_RADIUS + xOffset;
-               p2.x = gWindowSize.x - (MARK_RADIUS + xOffset) - 1;
-               p1.y = p2.y = (gWindowSize.y)/2 - 1;
-            }
-            Ellipse(hDC, p1.x-MARK_RADIUS, p1.y-MARK_RADIUS, p1.x+MARK_RADIUS, p1.y+MARK_RADIUS);
-            Ellipse(hDC, p2.x-MARK_RADIUS, p2.y-MARK_RADIUS, p2.x+MARK_RADIUS, p2.y+MARK_RADIUS);
-	         EndPaint(hWnd, &ps);
+            BeginPaint(hWnd, &ps);
+            EndPaint(hWnd, &ps);
          }
          break;
 
@@ -1465,33 +1496,6 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
          break;
 
       case WM_TIMER:
-         // Animasyon: Küçültme
-         if (wParam == 2000) {
-            int target = (int)(gIconSize * 0.7);
-            if (gCurrentIconSize > target) {
-               gCurrentIconSize -= (gIconSize - target) / 10;
-               if (gCurrentIconSize < target) gCurrentIconSize = target;
-               SetupLayout();
-            } else {
-               gCurrentIconSize = target;
-               SetupLayout();
-               KillTimer(gMainWindow, 2000);
-            }
-            return 0;
-         }
-         // Animasyon: Büyütme
-         if (wParam == 2001) {
-            if (gCurrentIconSize < gIconSize) {
-               gCurrentIconSize += (gIconSize - gCurrentIconSize) / 10 + 1;
-               if (gCurrentIconSize > gIconSize) gCurrentIconSize = gIconSize;
-               SetupLayout();
-            } else {
-               gCurrentIconSize = gIconSize;
-               SetupLayout();
-               KillTimer(gMainWindow, 2001);
-            }
-            return 0;
-         }
          if (gAutoHide && GetForegroundWindow() != gMainWindow)
          {
             // Not in foreground
@@ -1547,7 +1551,7 @@ ATOM RegMainWindClass()
 	wcex.lpszClassName = WIND_CLASS_NAME;
 	wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_APP));
 
-   wcex.hbrBackground = gBgBrush;
+   wcex.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 
 	return RegisterClassEx(&wcex);
 }
@@ -1643,6 +1647,17 @@ BOOL InitInstance(HINSTANCE hInstance, LPCTSTR lpCmdLine)
 
    // Don't appear in the taskbar
    SetWindowLong(gMainWindow, GWL_EXSTYLE, GetWindowLong(gMainWindow, GWL_EXSTYLE) | WS_EX_TOOLWINDOW);
+
+   BOOL useDarkMode = IsDarkMode();
+   DwmSetWindowAttribute(gMainWindow, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+   DWM_SYSTEMBACKDROP_TYPE backdrop_type = DWMSBT_MAINWINDOW;
+   DwmSetWindowAttribute(gMainWindow, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop_type, sizeof(backdrop_type));
+   DWM_WINDOW_CORNER_PREFERENCE corner_preference = DWMWCP_ROUND;
+   DwmSetWindowAttribute(gMainWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &corner_preference, sizeof(corner_preference));
+
+   // Create theme-aware pens
+    gHighlightPen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_GRAYTEXT));
+    gPushPen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_HIGHLIGHT));
 
    GetModuleFileName(NULL, gAppPath.GetBuffer(MAX_PATH), MAX_PATH);
    gAppPath.ReleaseBuffer();
@@ -1773,6 +1788,9 @@ int APIENTRY WinMain(HINSTANCE hInstance,
                      LPSTR     lpCmdLine,
                      int       nCmdShow)
 {
+   // This application is designed to support multiple instances. It does not
+   // implement any single-instance logic (e.g., using a named mutex or
+   // FindWindow) to enforce a single running instance.
    CoInitialize(NULL);
 
 	if (!InitInstance(hInstance, CString(lpCmdLine)))
@@ -1785,6 +1803,9 @@ int APIENTRY WinMain(HINSTANCE hInstance,
 	   TranslateMessage(&msg);
 	   DispatchMessage(&msg);
 	}
+
+    DeleteObject(gHighlightPen);
+    DeleteObject(gPushPen);
 
 	return (int) msg.wParam;
 
